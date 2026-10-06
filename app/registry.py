@@ -40,6 +40,21 @@
      已发布，GC 复核到候选重新可达而跳过；若始终没有标签引用，GC
      按可达性/宽限期正常复核，不会出现有记录无文件的悬空 blob。
 
+GC 宽限依据（blobs.created_at）= 「内容最近一次被真正接纳的时刻」，
+而不是首次创建时刻、也不是仓库关联时刻：
+
+   * 单块整体上传（POST ?digest=，body 已按摘要校验）与分块完成
+     （PUT ?digest=，active 会话的落盘内容已按摘要校验）是真正的内容
+     接纳，即使摘要已存在（同摘要重传）也把全局 blobs.created_at 刷新
+     为本次接纳时刻。dry-run 已把该摘要列入计划后、执行前发生的同摘要
+     重传因此重新落入宽限窗口，原计划执行复核时跳过它，不再删文件；
+   * 跨仓库挂载（?mount=&from=）本次未传输任何字节，只经 link_repo_blob
+     写命名空间关联，**不**刷新 blobs.created_at——不能靠「只刷新仓库
+     关联」给不可达内容续命；
+   * 已 committed 会话的同 digest 幂等重放不重复接纳内容，直接幂等返回，
+     **不**刷新 blobs.created_at——不能靠重放无限续期；
+   * 显式 grace=0 时不存在宽限窗口，接纳时刻再新，只要仍不可达即可删。
+
    flock 随进程死亡由内核自动释放，不会形成僵死锁；dry-run 持共享锁
    拍摄快照，多个 dry-run 可并行，但都不会看到发布进行到一半的状态。
 
@@ -205,7 +220,13 @@ class Registry:
 
     def finalize_upload(self, repo: str, upload_id: str, digest: str,
                         chunk: "bytes | None" = None):
-        """校验摘要并落库。已 committed 的会话允许同 digest 幂等重试。"""
+        """校验摘要并落库。已 committed 的会话允许同 digest 幂等重试。
+
+        裁决：committed 会话的幂等重放不重新接收/校验内容，直接幂等返回，
+        **不刷新全局 blobs.created_at**，因此无法靠反复重放给不可达内容
+        无限续期；只有 active 会话首次提交（真正接纳内容）才在锁内调用
+        admit_blob 刷新接纳时刻。
+        """
         with self.lock:
             u = self.db.get_upload(upload_id)
             if u is None or u["repo"] != repo:
@@ -259,7 +280,11 @@ class Registry:
                     raise E.upload_unknown(upload_id)
 
                 size = self.storage.commit_blob(path, digest)  # 按摘要去重
-                self.db.create_blob(digest, size)
+                # active 会话首次提交 = 真正的内容接纳（落盘字节已在上方
+                # 重算 sha256 校验）：刷新全局 blob 的接纳时刻作为 GC 宽限
+                # 依据。上方两处 committed 会话的幂等重放分支提前返回，不会
+                # 走到这里，故重放无法无限续期。
+                self.db.admit_blob(digest, size)
                 self.db.link_repo_blob(repo, digest)
                 self.db.set_upload_state(upload_id, "committed", digest)
                 return digest, size
@@ -280,7 +305,11 @@ class Registry:
                     f.write(payload)
                 with self.xlock.exclusive():
                     size = self.storage.commit_blob(tmp, digest)
-                    self.db.create_blob(digest, size)
+                    # 真正的内容接纳：把本次接纳时刻落实为全局 blob 的 GC
+                    # 宽限依据（首次写入或同摘要重传都刷新 blobs.created_at）。
+                    # 跨仓库挂载与 committed 会话幂等重放不走这里，故不会靠
+                    # 「只写关联」或「重放」无限续期。
+                    self.db.admit_blob(digest, size)
                     self.db.link_repo_blob(repo, digest)
             except BaseException:
                 tmp.unlink(missing_ok=True)
@@ -294,6 +323,12 @@ class Registry:
         时本方法观察到 blob 不存在而返回 False（路由按规范回退为普通
         上传会话）；本方法先关联成功时，随后的 GC 复核若候选仍无标签
         引用则按宽限期正常处理，不会产生有记录无文件的悬空关联。
+
+        裁决：挂载本次不传输任何字节，只是复用既有内容、写一条
+        repo_blobs 命名空间关联，因此**绝不刷新全局 blobs.created_at**
+        （不调用 admit_blob）。挂载不能把一个已过宽限期的不可达 blob
+        「刷」回宽限保护——只有真正重新接收并按摘要校验过内容的单块/
+        分块上传才刷新接纳时刻，避免靠只写仓库关联无限续期。
         """
         with self.lock, self.xlock.exclusive():
             if not self.db.blob_exists(digest) or not self.storage.has_blob(digest):
@@ -630,6 +665,14 @@ class Registry:
         #         本区间先完成时它拿到锁后文件也已删除，os.replace 落下
         #         完整新文件并重建关联（新记录受宽限期保护），重传先完成
         #         时则按复核结果可达跳过/超期正常删除。
+        #         特别地：dry-run 已把某摘要列为候选后、执行前发生的同摘要
+        #         重传（单块/分块，内容经摘要校验）会把全局 blobs.created_at
+        #         刷新为本次接纳时刻；下面的复核因此看到它重新落入宽限窗口
+        #         （created_at > grace_cutoff）而进入 skipped，不再删文件，
+        #         随后发布 manifest 不会遇到 MANIFEST_BLOB_UNKNOWN。跨仓库
+        #         挂载（只写关联）与 committed 会话幂等重放不刷新该时刻，
+        #         显式 grace=0 也没有宽限窗口——这两类 + 零宽限下仍不可达者
+        #         照常删除。
         #         异常时计划留在 executing，不回滚、不重放；flock 由内核
         #         在进程死亡时自动释放，不会僵死。 ----
         with self.lock, self.xlock.exclusive():
@@ -657,7 +700,9 @@ class Registry:
                                                  " tagged manifest"})
                 elif row["created_at"] > grace_cutoff:
                     skip_blobs.append({"digest": digest,
-                                       "reason": "within grace period again"})
+                                       "reason": "within grace period again:"
+                                                 " re-admitted by a same-digest"
+                                                 " upload after the plan was made"})
                 else:
                     delete_blobs.append({"digest": digest, "size": row["size"]})
 

@@ -135,6 +135,14 @@ def scenario(name, repo, payload, mode, tag):
     print(f"[A] GET retransmitted blob        -> {st}, "
           f"{len(body)} bytes, content intact")
 
+    # 5b) 单块/分块重传是「真正的内容接纳」：全局 blobs.created_at 已刷新为
+    #     本次接纳时刻（不再是演示里手工置的 0），成为 GC 宽限依据；挂载走
+    #     回退会话并在随后带字节 PUT 完成，同样刷新。
+    row = reg.db.get_blob(d_final)
+    assert row is not None and row["created_at"] > time.time() - 60, row
+    print(f"[db] global blobs.created_at      -> refreshed to admission time"
+          f" ({row['created_at']:.0f})")
+
     # 6) 发布标签 -> 201，且标签与 blob 都可拉取（修复前为 201 / 404）
     target_repo = "mount/dst" if mode == "mount" else repo
     manifest = json.dumps({

@@ -4,8 +4,12 @@
 写事务由 `with conn:` 保证提交/回滚，并设置 busy_timeout——多个进程挂载同一
 数据目录时，写锁冲突会等待而非立刻报错。表设计：
 
-- blobs       全局内容寻址 blob（按摘要去重）
-- repo_blobs  repo -> blob 的命名空间关联（同一 blob 可被多个 repo 可见）
+- blobs       全局内容寻址 blob（按摘要去重）。created_at 是「内容最近一次
+               被真正接纳（单块/分块上传并校验摘要）的时刻」，GC 宽限以此
+               为准：同摘要重传经 admit_blob UPSERT 刷新它；跨仓库挂载只写
+               repo_blobs、committed 会话幂等重放提前返回，都不刷新
+- repo_blobs  repo -> blob 的命名空间关联（同一 blob 可被多个 repo 可见；
+               只写此关联不影响全局宽限依据）
 - uploads     上传会话（落盘持久化，重启后可恢复/续传）
 - manifests   repo 内按摘要不可变存储的 manifest
 - tags        repo 内 tag -> manifest digest（CAS 更新）
@@ -167,12 +171,48 @@ class Database:
 
     # ---------------- blobs ----------------
 
-    def create_blob(self, digest: str, size: int):
+    def admit_blob(self, digest: str, size: int, now: "float | None" = None):
+        """接纳一份内容就位的全局 blob，返回 (是否为本次新接纳, 记录)。
+
+        全局 blob 按摘要去重，但 **GC 宽限期以「内容被接纳的时刻」为准**：
+        无论首次推送还是同摘要重传（单块整体上传、分块完成），只要调用方
+        确实重新接收并按摘要校验过完整内容（一次真正的内容接纳），就把
+        blobs.created_at 刷新为本次接纳时刻。于是 dry-run 已把该摘要列为
+        候选后、执行前发生的同摘要重传，会让原计划在执行复核时因
+        created_at 重新落入宽限窗口而跳过它，杜绝「重传 201、计划仍删文件、
+        随后发布 manifest 报 MANIFEST_BLOB_UNKNOWN」。
+
+        关键裁决——只有真正的内容接纳才调用本方法：
+          * 单块整体上传 POST ?digest=（body 已重算 sha256 校验）；
+          * 分块完成 PUT .../uploads/<id>?digest=（active 会话，落盘内容
+            已重算校验）。
+        以下两类 **不得** 刷新宽限依据，避免靠「只写关联」或「重放」无限续期：
+          * 跨仓库挂载 ?mount=&from=：内容早已存在、本次未传输任何字节，
+            只经 link_repo_blob 写 repo_blobs 关联，绝不调用本方法；
+          * 已 committed 会话的同 digest 幂等重放：不重复接纳内容，在
+            Registry 层提前返回、不调用本方法。
+
+        显式 grace=0 时 created_at 再新也不落在宽限窗口内，仍不可达即可删，
+        因此刷新接纳时间不会让零宽限回收失效。
+        """
+        ts = time.time() if now is None else now
         with self._lock, self._conn:
+            existed = self._conn.execute(
+                "SELECT 1 FROM blobs WHERE digest = ?", (digest,)
+            ).fetchone() is not None
+            # UPSERT：冲突（同摘要重传）时只刷新 created_at，不改动 size
+            # （内容寻址保证字节一致）。rowcount 在 insert 与 update 时都为 1，
+            # 不能据此区分，故用冲突前的存在性判定 fresh。
             self._conn.execute(
-                "INSERT OR IGNORE INTO blobs (digest, size, created_at) VALUES (?, ?, ?)",
-                (digest, size, time.time()),
+                "INSERT INTO blobs (digest, size, created_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(digest) DO UPDATE SET created_at = excluded.created_at",
+                (digest, size, ts),
             )
+        return (not existed), self.get_blob(digest)
+
+    def create_blob(self, digest: str, size: int):
+        """兼容包装：内容接纳（含同摘要重传刷新接纳时间）。"""
+        self.admit_blob(digest, size)
 
     def get_blob(self, digest: str) -> "dict | None":
         with self._lock:

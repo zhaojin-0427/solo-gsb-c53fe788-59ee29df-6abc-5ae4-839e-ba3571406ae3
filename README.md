@@ -16,6 +16,7 @@
 | 不可变 manifest | digest 寻址的 manifest 内容与摘要不符即拒绝；发布时校验 config/layers/subject/子 manifest 引用必须已存在，杜绝悬空引用 |
 | 标签 CAS | 移动已存在的标签必须携带期望摘要（`If-Match` 头或 `?expected=`），不匹配返回 `409 TAG_CONFLICT` |
 | 安全 GC | 以「标签 + 未过期上传租约」为根建立可达图；**先 dry-run 生成持久化复核计划（`plan_id`，1 小时有效、重启有效），再凭 `plan_id` 执行**；执行前在 SQLite 中原子认领计划（`pending → executing`），多个进程共享同一数据目录并发执行同一计划时只有一个进程认领成功并删除，竞争方返回 `409 GC_PLAN_IN_PROGRESS` 且不碰候选；认领后进程崩溃则计划永久停留在 `executing`（不可重放），全部删除完成才标记 `executed`；执行时重算可达性/租约，只删计划内仍符合条件的对象，复核窗口内新产生的候选不会被误删；与并发拉取互斥 |
+| 宽限依据=最近接纳时刻 | GC 宽限期看的是全局 `blobs.created_at`——**内容最近一次被真正接纳（单块整体上传、分块完成，均经摘要校验）的时刻**。dry-run 已把某摘要列入计划后、执行前同摘要重传再次返回 201 时，会刷新该全局时刻，使对象在非零宽限内被**原计划跳过**；跨仓库挂载（只写关联、不传字节）与已 committed 会话的幂等重放**不刷新**，不能靠「只刷仓库关联」或「重放」无限续期；显式 `grace_seconds=0` 且仍不可达者照删 |
 | 跨进程发布/GC 协调 | 进程内锁跨进程无效时，**manifest 发布（引用校验→标签提交）、blob 提交（单块重传/分块完成/跨仓库挂载的内容就位→关联落库）与 GC 执行（认领后可达性复核→元数据和文件删除）由一把 `flock` 文件锁跨进程串行**：发布先提交标签则 GC 跳过已重新可达的候选；GC 先删完则发布返回 `400 MANIFEST_BLOB_UNKNOWN` 且无可见标签；同摘要重传先完成则 GC 按可达性/宽限期正常复核，GC 先删完则重传落下完整新文件并重建关联（挂载按规范回退普通上传）。任何时刻「标签可见时其引用必可拉取」 |
 
 ## 快速开始（Docker Compose 一键启动）
@@ -58,7 +59,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 5000
 | --- | --- | --- |
 | `REGISTRY_DATA_DIR` | `./data`（镜像内 `/data`） | 数据目录（SQLite + blob 文件 + 上传临时文件） |
 | `REGISTRY_UPLOAD_LEASE_SECONDS` | `3600` | 上传会话租约；超时无读写即被 GC 回收 |
-| `REGISTRY_GC_GRACE_SECONDS` | `3600` | GC 宽限期；创建不足该时长的未引用 blob 不回收，保护「已推送、待发布」窗口 |
+| `REGISTRY_GC_GRACE_SECONDS` | `3600` | GC 宽限期；最近一次被**真正接纳**（单块/分块上传并校验摘要）不足该时长的未引用 blob 不回收，保护「已推送、待发布」窗口。同摘要重传会刷新该接纳时刻，跨仓库挂载与幂等重放不会 |
 
 ## API 一览
 
@@ -436,6 +437,120 @@ $ curl -s -X POST -H 'Content-Type: application/json' \
 # {"plan_id": "23338789...", "delete": {"blobs": [{"digest": "sha256:c97adf18..."}]}, ...}
 ```
 
+#### 同摘要重传的接纳时间 = 全局 GC 宽限依据（修复 GC 误删）
+
+**问题场景**：一个未被任何标签引用的 blob 已老过**非零**宽限期，被 dry-run
+列入 `/gc` 计划；在 dry-run 与执行之间，同一摘要的内容经**单块整体上传、
+分块完成或跨仓库挂载**再次到达（去重，返回 201）。修复前去重逻辑用
+`INSERT OR IGNORE` 保留**旧的** `blobs.created_at`，挂载只写
+`repo_blobs` 关联，于是原 `plan_id` 执行时仍按旧时刻判定「超宽限」而删掉
+物理文件，随后 `PUT manifest` 的引用校验只看数据库（通过、201），拉取该
+blob 却 404——`MANIFEST_BLOB_UNKNOWN` 悬空引用。
+
+**裁决：区分「真正的内容接纳」与「幂等重放 / 只写关联」**
+
+| 提交方式 | 是否传输并按摘要校验了内容 | 刷新全局 `blobs.created_at`？ | 非零宽限内原计划 |
+| --- | --- | --- | --- |
+| 单块整体上传 `POST ?digest=`（带 body） | 是 | **是**（`admit_blob` UPSERT） | 跳过该 blob |
+| 分块完成 `PUT .../uploads/<id>?digest=`（active 会话） | 是 | **是**（`admit_blob` UPSERT） | 跳过该 blob |
+| 跨仓库挂载 `?mount=&from=` | 否（零字节，复用既有内容） | **否**（只 `link_repo_blob`） | 仍不可达则删 |
+| 已 committed 会话的同 digest 幂等重放 | 否（不重新接纳） | **否**（提前幂等返回） | 仍不可达则删 |
+| 任意提交，但计划显式 `grace_seconds=0` | — | 刷新也无宽限窗口 | **仍不可达即删** |
+
+要点：宽限依据是**全局 blob 行**上「内容最近一次被真正接纳的时刻」，不是
+首次创建时刻，也**不是**仓库关联（`repo_blobs`）时刻——因此既不会只刷新
+仓库关联就给不可达内容续命，也无法靠反复重放已完成的会话无限续期。摘要
+校验、计划认领及范围、跨进程删除顺序（先元数据后文件）、标签 CAS 全部不变。
+
+实际请求与响应（服务在 `localhost:5000`，默认非零宽限 3600s）：
+
+```bash
+$ printf 'readmitted-after-dryrun-demo-payload' > layer.bin
+$ DIGEST="sha256:$(sha256sum layer.bin | cut -d' ' -f1)"
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST --data-binary @layer.bin \
+    "http://localhost:5000/v2/demo/app/blobs/uploads?digest=$DIGEST"
+201
+
+# 让它老过非零宽限（演示用，直接把全局接纳时刻置为 0）
+$ sqlite3 /data/registry.db "UPDATE blobs SET created_at=0"
+
+# dry-run（默认 grace=3600）把它列为计划内候选
+$ curl -s -X POST -H 'Content-Type: application/json' -d '{"dry_run": true}' \
+    http://localhost:5000/gc
+# {"plan_id":"47961abcae764897b906c21ec29cce37",
+#  "grace_seconds":3600,
+#  "delete":{"blobs":[{"digest":"sha256:5977366b...","reason":"unreferenced and older than grace period"}]}}
+
+# ★ 执行前同摘要重传（真正重新接收并校验内容）-> 仍 201，全局接纳时刻被刷新
+$ curl -s -i -X POST --data-binary @layer.bin \
+    "http://localhost:5000/v2/demo/app/blobs/uploads?digest=$DIGEST" | head -5
+# HTTP/1.1 201 Created
+# location: /v2/demo/app/blobs/sha256:5977366b7bb17b9a80b4a4dc643357d604482ca445d7e87f0d275111b04272f4
+# docker-content-digest: sha256:5977366b7bb17b9a80b4a4dc643357d604482ca445d7e87f0d275111b04272f4
+
+# 执行原计划：候选因「重新落入宽限窗口」进入 skipped，文件不删
+$ curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"dry_run": false, "plan_id": "47961abcae764897b906c21ec29cce37"}' \
+    http://localhost:5000/gc
+```
+
+```json
+{
+  "dry_run": false, "executed": true,
+  "plan_id": "47961abcae764897b906c21ec29cce37",
+  "grace_seconds": 3600,
+  "summary": {"blobs_deleted": 0, "manifests_deleted": 0, "uploads_deleted": 0,
+              "blobs_skipped": 1, "manifests_skipped": 0, "uploads_skipped": 0,
+              "bytes_reclaimed": 0},
+  "deleted": {"blobs": [], "manifests": [], "uploads": []},
+  "skipped": {
+    "blobs": [
+      {"digest": "sha256:5977366b7bb17b9a80b4a4dc643357d604482ca445d7e87f0d275111b04272f4",
+       "reason": "within grace period again: re-admitted by a same-digest upload after the plan was made"}
+    ],
+    "manifests": [], "uploads": []
+  }
+}
+```
+
+随后发布引用它的 manifest 成功，标签与 blob 都可拉取（修复前为
+`PUT 201`、随后/并发 `GET blob 404`）：
+
+```bash
+$ curl -s -o /dev/null -w 'PUT manifest -> %{http_code}\n' -X PUT \
+    -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' \
+    --data '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
+             "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar",
+                        "digest":"sha256:5977366b...","size":36}]}' \
+    http://localhost:5000/v2/demo/app/manifests/v1
+# PUT manifest -> 201
+$ curl -s -o /dev/null -w 'GET blob -> %{http_code}\n' \
+    "http://localhost:5000/v2/demo/app/blobs/$DIGEST"
+# GET blob -> 200
+```
+
+对照组（同样在 dry-run 之后、执行之前）：
+
+```bash
+# 跨仓库挂载：201，但全局 created_at 不变；仍不可达 -> 原计划删除
+$ curl -s -o /dev/null -w 'mount -> %{http_code}\n' -X POST \
+    "http://localhost:5000/v2/dst/repo/blobs/uploads?mount=$DIGEST&from=src/repo"
+# mount -> 201   （sqlite3 查 blobs.created_at 仍为旧值）
+# execute -> {"blobs_deleted": 1, ...}；src/dst 两个仓库 GET 均 404
+
+# committed 会话幂等重放：两次 PUT 都 201，但 created_at 不变 -> 原计划删除
+$ curl -s -o /dev/null -w '%{http_code}\n' -X PUT "$LOC?digest=$DIGEST"   # 201
+$ curl -s -o /dev/null -w '%{http_code}\n' -X PUT "$LOC?digest=$DIGEST"   # 201
+# execute -> {"blobs_deleted": 1, ...}
+
+# 显式零宽限：刚重传接纳（created_at 全新）也照删
+$ curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"dry_run": true, "grace_seconds": 0}' http://localhost:5000/gc   # 拿到 plan
+$ curl -s -o /dev/null -X POST --data-binary @layer.bin \
+    "http://localhost:5000/v2/demo/app/blobs/uploads?digest=$DIGEST"       # 重传 201
+# execute -> {"blobs_deleted": 1, ...}；GET blob -> 404
+```
+
 GC 语义：
 
 - **两阶段复核**：dry-run 快照候选为持久化计划（`gc_plans` 等表），执行必须凭
@@ -464,6 +579,14 @@ GC 语义：
 - **执行时复核（TOCTOU 防护）**：认领成功后以**计划记录的宽限期**重新
   计算可达图与上传租约——计划内且仍不可达/仍超宽限/租约仍过期的才删除；
   重新可达、续租或已不存在的进入 `skipped`。
+- **宽限依据=最近接纳时刻**：宽限判定读全局 `blobs.created_at`，即内容
+  **最近一次被真正接纳**（单块整体上传/active 会话分块完成，均经摘要校验）
+  的时刻。dry-run 已列候选、执行前发生的同摘要重传会 UPSERT 刷新该时刻，
+  非零宽限内的重接纳对象被原计划 `skipped`（reason
+  `within grace period again: re-admitted by a same-digest upload ...`）；
+  跨仓库挂载只写 `repo_blobs` 关联、已 committed 会话幂等重放提前返回，
+  二者都不刷新该时刻，杜绝「只刷仓库关联」与「靠重放无限续期」；显式
+  `grace_seconds=0` 无宽限窗口，重接纳后仍不可达者照删。
 - **计划外不碰**：dry-run 之后因标签移动、删除、悬空推送新产生的候选不在计划内，
   本次执行绝不删除，留待下次 dry-run 审阅（上面已实测）。
 - **根集合**：所有 tag 指向的 manifest；沿 `config`/`layers`/`manifests[]`/
@@ -659,12 +782,17 @@ manifest」互斥，而**不与 blob 提交互斥**，于是共享目录的两�
 manifest 发布区间，在同一把跨进程排他 `flock` 上严格串行。于是只有两种
 交错，且都安全：
 
-- **重传/挂载先完成**：blob 内容与关联先成为既成事实；若此后标签已发布，
-  GC 复核到候选重新可达 → `skipped`，不删；若始终没有标签引用，GC 按
-  可达性/宽限期正常回收，不会出现有记录无文件的悬空 blob。
+- **重传（单块/分块，真正接纳内容）先完成**：blob 内容与关联先成为既成
+  事实，且全局 `blobs.created_at` 被刷新为本次接纳时刻。若此后标签已发布，
+  GC 复核到候选重新可达 → `skipped`，不删；即使标签始终没发布，非零宽限内
+  的原计划也会因「重新落入宽限窗口」而跳过它（详见上
+  「同摘要重传的接纳时间 = 全局 GC 宽限依据」），只有显式 `grace=0` 或
+  再次老过宽限后才按正常复核回收，不会出现有记录无文件的悬空 blob。
+- **挂载先完成（零字节、只写关联）**：不刷新全局接纳时刻；候选若仍不可达，
+  原计划按其旧接纳时刻正常复核（非零宽限已超期即删，挂载不续命）。
 - **GC 先完成**：重传方在锁外等到「元数据与文件都删完」才继续，
   `os.replace` 把**刚按摘要校验过的完整新内容**落为新文件并重建关联
-  （新记录受宽限期保护）；随后发布标签 `201`、拉取 blob `200`。跨仓库
+  （新接纳时刻受宽限期保护）；随后发布标签 `201`、拉取 blob `200`。跨仓库
   挂载方则观察到 blob 已不存在，`mount_blob` 返回 `false`，路由按 OCI
   规范**回退为普通上传会话（202）**，不会产生指向不存在内容的挂载。
 
@@ -821,7 +949,7 @@ app/
   digest.py     # digest/tag/repo 校验与 sha256 计算
   errors.py     # OCI 错误模型（含 GC_PLAN_*，认领失败为 GC_PLAN_IN_PROGRESS 409）
   config.py     # 环境变量配置（含 registry.lock 路径）
-tests/test_registry.py   # 39 个端到端测试
+tests/test_registry.py   # 45 个端到端测试
 tests/live_race_demo.py  # 双进程删除窗口真实 HTTP 竞态演示（手动运行，非 pytest 用例）
 Dockerfile / docker-compose.yml（默认单实例；--profile multiproc 启动共享卷双实例）
 ```
@@ -850,7 +978,15 @@ HTTP mock）：发布先提交标签时 GC 复核在锁后进行、候选重新�
 子进程在 GC「已删元数据、未删文件」窗口内发起，均被 flock 挡到删除完成——
 重传落下完整新文件并重建关联（标签 201、blob 200），挂载按规范回退普通
 上传会话（202）；重传并先发布标签时 GC 复核跳过可达候选。这四个测试在
-修复前的代码上确定性失败（重传不被阻塞，产生有记录无文件的悬空 blob）**。
+修复前的代码上确定性失败（重传不被阻塞，产生有记录无文件的悬空 blob）**；
+**再新增六个「接纳时刻 = 全局宽限依据」测试：非零宽限下 dry-run 列候选后，
+单块同摘要重传、active 会话分块完成、重传到另一仓库都会 UPSERT 刷新全局
+`blobs.created_at`，原计划执行时因重新落入宽限窗口而 `skipped`、文件保留、
+随后发布 manifest 201 且 blob 200；跨仓库挂载（只写关联）与已 committed
+会话的同 digest 幂等重放**不**刷新该时刻，原计划仍删除不可达对象；显式
+`grace_seconds=0` 时即使刚重传接纳，仍不可达即删。其中三个「刷新」测试在
+修复前（`INSERT OR IGNORE` 保留旧时刻）确定性失败（原计划删除文件，随后
+manifest 悬空）。
 真实 HTTP 的删除窗口复现可手动运行 `python3 tests/live_race_demo.py
 <data_dir>`（另起一个 uvicorn 实例，脚本作为共享目录的第二个进程）。
 
