@@ -4,8 +4,12 @@
 写事务由 `with conn:` 保证提交/回滚，并设置 busy_timeout——多个进程挂载同一
 数据目录时，写锁冲突会等待而非立刻报错。表设计：
 
-- blobs       全局内容寻址 blob（按摘要去重）
-- repo_blobs  repo -> blob 的命名空间关联（同一 blob 可被多个 repo 可见）
+- blobs       全局内容寻址 blob（按摘要去重）。created_at 是**全局接纳时间**：
+              真正的新接纳（新内容提交 / 同摘要重新提交 / 跨仓库首次挂载）会
+              把它刷新为接纳时刻；已 committed 会话的幂等重放、已存在的仓库
+              关联重复挂载都不刷新，避免零成本无限续期。GC 宽限只认这一列
+- repo_blobs  repo -> blob 的命名空间关联（同一 blob 可被多个 repo 可见）；
+              created_at 仅为关联建立时间，与 GC 宽限无关
 - uploads     上传会话（落盘持久化，重启后可恢复/续传）
 - manifests   repo 内按摘要不可变存储的 manifest
 - tags        repo 内 tag -> manifest digest（CAS 更新）
@@ -167,10 +171,19 @@ class Database:
 
     # ---------------- blobs ----------------
 
-    def create_blob(self, digest: str, size: int):
+    def admit_blob(self, digest: str, size: int):
+        """接纳一个 blob：新内容插入，已存在则**刷新全局接纳时间**。
+
+        同摘要重传（单块整体上传 / 分块完成 / 跨仓库首次挂载）是一次真正的
+        新接纳：即使按内容去重不写第二份文件，也必须把全局 created_at 推进到
+        接纳时刻，使非零宽限 GC 把它当新对象保护。已 committed 上传会话的
+        幂等重放、重复的同仓库挂载**不调用**本方法——它们没有重新接纳内容，
+        不能用来无限续期。
+        """
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT OR IGNORE INTO blobs (digest, size, created_at) VALUES (?, ?, ?)",
+                "INSERT INTO blobs (digest, size, created_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(digest) DO UPDATE SET created_at = excluded.created_at",
                 (digest, size, time.time()),
             )
 
@@ -188,12 +201,19 @@ class Database:
         with self._lock:
             return [dict(r) for r in self._conn.execute("SELECT * FROM blobs").fetchall()]
 
-    def link_repo_blob(self, repo: str, digest: str):
+    def link_repo_blob(self, repo: str, digest: str) -> bool:
+        """写入 repo -> blob 关联。返回 True 表示本次新建了关联（跨仓库首次
+        挂载），False 表示关联早已存在（幂等重放）。
+
+        只写关联、不改全局 blobs.created_at——GC 宽限依据是全局接纳时间，
+        不能因重复刷新仓库关联而续期；调用方在 True 时另行 admit_blob。
+        """
         with self._lock, self._conn:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "INSERT OR IGNORE INTO repo_blobs (repo, digest, created_at) VALUES (?, ?, ?)",
                 (repo, digest, time.time()),
             )
+            return cur.rowcount == 1
 
     def repo_has_blob(self, repo: str, digest: str) -> bool:
         with self._lock:

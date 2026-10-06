@@ -40,6 +40,16 @@
      已发布，GC 复核到候选重新可达而跳过；若始终没有标签引用，GC
      按可达性/宽限期正常复核，不会出现有记录无文件的悬空 blob。
 
+   GC 宽限只认全局 blobs.created_at（接纳时间）。真正的新接纳会刷新它：
+   单块整体上传（重新传输并校验了全部字节）、active 分块会话的首次提交、
+   跨仓库首次挂载（新写入 repo_blobs 关联）；因此 dry-run 已把某不可达
+   blob 列为候选后，若它在非零宽限内被重新接纳，原计划执行复核时会因
+   created_at 重新变新而跳过——这正是“同摘要重传后 GC 误删”的修复点。
+   幂等重放不刷新它：已 committed 会话带同 digest 重放 PUT、向已有该
+   关联的仓库重复挂载，均为零成本 no-op，不能借此无限续期。显式零宽限
+   （grace_seconds=0）下 cutoff 即当前时刻，接纳后仍不可达的对象可立即
+   回收。仅刷新 repo_blobs 关联时间不影响 GC（宽限从不读取仓库关联）。
+
    flock 随进程死亡由内核自动释放，不会形成僵死锁；dry-run 持共享锁
    拍摄快照，多个 dry-run 可并行，但都不会看到发布进行到一半的状态。
 
@@ -211,6 +221,8 @@ class Registry:
             if u is None or u["repo"] != repo:
                 raise E.upload_unknown(upload_id)
             if u["state"] == "committed":
+                # 已提交会话的幂等重放：只确认关联仍在，绝不刷新全局
+                # created_at，否则同一次提交可被反复重放、无限续期。
                 if u["digest"] == digest and self.db.repo_has_blob(repo, digest):
                     blob = self.db.get_blob(digest)
                     return digest, blob["size"] if blob else 0
@@ -246,6 +258,7 @@ class Registry:
             with self.xlock.exclusive():
                 u = self.db.get_upload(upload_id)
                 if u is not None and u["repo"] == repo and u["state"] == "committed":
+                    # 幂等重放：原样返回，不 admit、不刷新 created_at
                     if u["digest"] == digest and self.db.repo_has_blob(repo, digest):
                         blob = self.db.get_blob(digest)
                         return digest, blob["size"] if blob else 0
@@ -259,7 +272,11 @@ class Registry:
                     raise E.upload_unknown(upload_id)
 
                 size = self.storage.commit_blob(path, digest)  # 按摘要去重
-                self.db.create_blob(digest, size)
+                # active 会话的本次提交是一次真正的新接纳：同摘要重传也刷新
+                # 全局接纳时间（GC 宽限唯一依据），保证计划生成后重传的内容
+                # 在非零宽限内被原计划跳过；上面 committed 分支的幂等重放
+                # 不到这里，因此不能靠重放无限续期。
+                self.db.admit_blob(digest, size)
                 self.db.link_repo_blob(repo, digest)
                 self.db.set_upload_state(upload_id, "committed", digest)
                 return digest, size
@@ -280,7 +297,11 @@ class Registry:
                     f.write(payload)
                 with self.xlock.exclusive():
                     size = self.storage.commit_blob(tmp, digest)
-                    self.db.create_blob(digest, size)
+                    # 单块整体上传携带的是重新提交的完整内容（摘要已在内存
+                    # 复核），这是一次真正的新接纳：同摘要重传也把全局接纳
+                    # 时间推进到现在，使非零宽限 GC 在复核时把它当新对象跳过。
+                    # 这与“零成本续期”不同——请求重新传输并校验了全部字节。
+                    self.db.admit_blob(digest, size)
                     self.db.link_repo_blob(repo, digest)
             except BaseException:
                 tmp.unlink(missing_ok=True)
@@ -294,11 +315,18 @@ class Registry:
         时本方法观察到 blob 不存在而返回 False（路由按规范回退为普通
         上传会话）；本方法先关联成功时，随后的 GC 复核若候选仍无标签
         引用则按宽限期正常处理，不会产生有记录无文件的悬空关联。
+
+        只有**首次**把 blob 挂入一个新仓库（新写入 repo_blobs 关联）才刷新
+        全局 blobs.created_at：这等价于一次跨仓库的重新接纳，dry-run 已计划
+        回收的不可达 blob 因此在非零宽限内被原计划跳过。关联早已存在时重复
+        挂载是幂等 no-op，不刷新任何时间戳——不能靠反复挂载同一仓库无限续期。
         """
         with self.lock, self.xlock.exclusive():
-            if not self.db.blob_exists(digest) or not self.storage.has_blob(digest):
+            blob = self.db.get_blob(digest)
+            if blob is None or not self.storage.has_blob(digest):
                 return False
-            self.db.link_repo_blob(repo, digest)
+            if self.db.link_repo_blob(repo, digest):
+                self.db.admit_blob(digest, blob["size"])
             return True
 
     def cancel_upload(self, repo: str, upload_id: str):
@@ -656,8 +684,15 @@ class Registry:
                                        "reason": "reachable again: referenced by a"
                                                  " tagged manifest"})
                 elif row["created_at"] > grace_cutoff:
-                    skip_blobs.append({"digest": digest,
-                                       "reason": "within grace period again"})
+                    # 计划生成之后 blob 被真正重新接纳（同摘要单块/分块重传
+                    # 或跨仓库首次挂载刷新了全局接纳时间），此刻仍在非零宽限
+                    # 内——原计划必须跳过；显式零宽限时 cutoff==now，永不命中。
+                    if grace > 0:
+                        reason = ("readmitted within grace period after the plan"
+                                  " was generated")
+                    else:
+                        reason = "within grace period again"
+                    skip_blobs.append({"digest": digest, "reason": reason})
                 else:
                     delete_blobs.append({"digest": digest, "size": row["size"]})
 

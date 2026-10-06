@@ -1284,6 +1284,171 @@ def test_reupload_then_publish_first_gc_skips_reachable(client, settings):
     assert client.get(f"/v2/{repo}/manifests/v1").content == manifest
 
 
+# ---------------- 同摘要重传/挂载的全局接纳时间 vs GC 宽限 ----------------
+#
+# 修复点：去重保留旧 blobs.created_at、挂载只写关联，导致 dry-run 已计划
+# 回收的不可达 blob 在执行前被重新接纳（单块/分块/挂载，仍返回 201）后，
+# 原计划仍按旧接纳时间删除，随后发布 manifest 报 MANIFEST_BLOB_UNKNOWN。
+# 规则：真正的新接纳刷新全局 blobs.created_at（GC 宽限唯一依据）；已提交
+# 会话幂等重放、重复挂载已有关联的仓库不刷新（不可无限续期）；显式零宽限
+# 且仍不可达者立即删除。
+
+def _blob_created_at(registry, digest: str) -> float:
+    with registry.lock:
+        return registry.db.get_blob(digest)["created_at"]
+
+
+def test_same_digest_monolithic_reupload_refreshes_global_admission_time(client):
+    """计划生成后、执行前的同摘要单块重传是新接纳：全局 created_at 刷新，
+    非零宽限内原计划跳过；随后发布 manifest 201、blob 可拉取。"""
+    registry = client.app.state.registry
+    payload = b"retransmitted between dry-run and execute"
+    d = push_blob(client, "app", payload)
+    first_admitted = _blob_created_at(registry, d)
+    _age_all_blobs(registry)  # 模拟早已过宽限期的候选
+    assert _blob_created_at(registry, d) == 0
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 3600}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+
+    # 执行前同摘要重传（去重，仍 201）
+    assert push_blob(client, "app", payload) == d
+    readmitted = _blob_created_at(registry, d)
+    assert readmitted > first_admitted  # 全局接纳时间被刷新，不再是旧值
+    assert readmitted > time.time() - 60
+
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["blobs_deleted"] == 0
+    assert rep["summary"]["blobs_skipped"] == 1
+    skipped = rep["skipped"]["blobs"][0]
+    assert skipped["digest"] == d
+    assert "readmitted within grace period" in skipped["reason"]
+    assert client.get(f"/v2/app/blobs/{d}").status_code == 200
+
+    # 修复前的最终症状：发布引用它的 manifest 报 MANIFEST_BLOB_UNKNOWN
+    cfg = push_blob(client, "app", b"cfg-after-readmit")
+    manifest = make_manifest(b"cfg-after-readmit", [payload])
+    r = push_manifest(client, "app", "v1", manifest)
+    assert r.headers["Docker-Content-Digest"] == digest_of(manifest)
+    assert client.get(f"/v2/app/blobs/{d}").content == payload
+
+
+def test_same_digest_chunked_commit_refreshes_admission_but_replay_does_not(client):
+    """active 分块会话完成提交刷新全局接纳时间；已 committed 会话的幂等重放
+    不刷新（不能靠重放无限续期）。"""
+    registry = client.app.state.registry
+    payload = b"chunked commit readmits the global blob"
+    d = push_blob(client, "app", payload)
+    _age_all_blobs(registry)
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 3600}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+
+    # 新的分块会话完成同摘要内容提交 -> 真正的新接纳
+    loc = client.post("/v2/app/blobs/uploads").headers["Location"]
+    client.patch(loc, content=payload)
+    r = client.put(f"{loc}?digest={d}")
+    assert r.status_code == 201
+    admitted = _blob_created_at(registry, d)
+    assert admitted > time.time() - 60
+
+    # 该已 committed 会话被幂等重放：接纳时间保持不变（无续期）
+    assert client.put(f"{loc}?digest={d}").status_code == 201
+    assert _blob_created_at(registry, d) == admitted
+
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["blobs_deleted"] == 0
+    assert rep["skipped"]["blobs"][0]["digest"] == d
+    assert client.get(f"/v2/app/blobs/{d}").status_code == 200
+
+
+def test_cross_repo_mount_first_link_refreshes_repeated_mount_does_not(client):
+    """跨仓库首次挂载（新写入关联）刷新全局接纳时间；向已有关联的仓库重复
+    挂载是幂等 no-op，不刷新任何时间戳。"""
+    registry = client.app.state.registry
+    payload = b"mounted into another repo after the plan"
+    d = push_blob(client, "src/repo", payload)
+    _age_all_blobs(registry)
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 3600}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+
+    # 首次挂入新仓库 -> 201，且全局接纳时间刷新
+    r = client.post(f"/v2/dst/repo/blobs/uploads?mount={d}&from=src/repo")
+    assert r.status_code == 201
+    admitted = _blob_created_at(registry, d)
+    assert admitted > time.time() - 60
+
+    # 重复挂入同一仓库（关联早已存在）-> 仍 201，但不刷新
+    assert client.post(
+        f"/v2/dst/repo/blobs/uploads?mount={d}&from=src/repo"
+    ).status_code == 201
+    assert _blob_created_at(registry, d) == admitted
+
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["blobs_deleted"] == 0
+    assert rep["skipped"]["blobs"][0]["digest"] == d
+    assert client.get(f"/v2/dst/repo/blobs/{d}").status_code == 200
+
+
+def test_explicit_zero_grace_deletes_readmitted_still_unreachable_blob(client):
+    """显式 grace_seconds=0：计划后重新接纳的 blob 若仍不可达，执行复核时
+    cutoff==now，照样删除；之后发布引用它的 manifest 返回
+    MANIFEST_BLOB_UNKNOWN（标签不写入）。"""
+    registry = client.app.state.registry
+    payload = b"readmitted but zero grace and still untagged"
+    d = push_blob(client, "app", payload)
+    _age_all_blobs(registry)
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+
+    # 执行前同摘要重传：接纳时间刷新，但零宽限不提供保护
+    assert push_blob(client, "app", payload) == d
+    assert _blob_created_at(registry, d) > time.time() - 60
+
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["blobs_deleted"] == 1
+    assert {b["digest"] for b in rep["deleted"]["blobs"]} == {d}
+    assert client.get(f"/v2/app/blobs/{d}").status_code == 404
+
+    manifest = _layer_only_manifest(d, len(payload))
+    r = client.put("/v2/app/manifests/v1", content=manifest,
+                   headers={"Content-Type": OCI_MANIFEST})
+    assert r.status_code == 400
+    assert r.json()["errors"][0]["code"] == "MANIFEST_BLOB_UNKNOWN"
+    assert client.get("/v2/app/manifests/v1").status_code == 404
+
+
+def test_readmitted_blob_still_deleted_after_its_fresh_grace_expires(client):
+    """重新接纳只给一个宽限窗口，不是永久保护：下一轮 dry-run 在宽限过后
+    仍把不可达 blob 回收（不会被无限续期）。"""
+    registry = client.app.state.registry
+    payload = b"readmission grants only one grace window"
+    d = push_blob(client, "app", payload)
+    _age_all_blobs(registry)
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 3600}).json()
+    assert push_blob(client, "app", payload) == d
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["blobs_deleted"] == 0
+    assert client.get(f"/v2/app/blobs/{d}").status_code == 200
+
+    # 宽限过后重新 dry-run + 执行：仍不可达 -> 删除
+    _age_all_blobs(registry)
+    plan2 = client.post("/gc", json={"dry_run": True, "grace_seconds": 3600}).json()
+    assert d in {b["digest"] for b in plan2["delete"]["blobs"]}
+    rep2 = client.post("/gc", json={"dry_run": False,
+                                    "plan_id": plan2["plan_id"]}).json()
+    assert rep2["summary"]["blobs_deleted"] == 1
+    assert client.get(f"/v2/app/blobs/{d}").status_code == 404
+
+
 # ---------------- 重启恢复 ----------------
 
 def test_upload_survives_restart(settings):

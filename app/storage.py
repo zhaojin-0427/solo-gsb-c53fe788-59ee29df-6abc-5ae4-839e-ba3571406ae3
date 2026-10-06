@@ -48,6 +48,10 @@ class FileStorage:
         复核，内容寻址保证两者字节一致），可安全去重；否则 os.replace
         原子落位。若不持锁，旧文件可能是即将被 GC 删除的残留，去重会丢弃
         新内容而留下悬空元数据。
+
+        无论走哪条分支，调用方（Registry）随后都执行 admit_blob：新文件
+        插入记录、已存在则把全局 created_at 刷新为本次接纳时刻——GC 宽限
+        依据的是接纳时间而不是文件 inode 时间，去重保留旧文件不影响保护。
         """
         target = self.blob_path(digest)
         if target.exists():
